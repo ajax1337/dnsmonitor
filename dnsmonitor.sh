@@ -1,31 +1,65 @@
 #!/bin/sh
+# dnsmonitor.sh - monitor DNS connections via nf_conntrack
+#
+# This script is intended to run on OpenWrt using BusyBox utilities.
+# It periodically parses the conntrack tables and logs DNS related entries.
 
-# Changed egrep to grep -E
+INTERVAL=30
+LOGFILE=/var/log/dnsmonitor.log
+DATA=/tmp/dnsmonitor.out
+NF_CT4=/proc/net/nf_conntrack
+NF_CT6=/proc/net/nf_conntrack6
 
-#          name: merlin-dns-monitor.sh
-#       version: 1.4.2, 26-apr-2022, by eibgrad
-#       purpose: monitor what dns servers are active and where routed
-# ... (other script content) ...
+check_tools() {
+    for t in grep awk sort; do
+        command -v "$t" >/dev/null 2>&1 || {
+            echo "Required tool '$t' not found" >&2
+            exit 1
+        }
+    done
+}
 
-# Function or script segment dealing with DNS monitoring
-# This part shows the corrected use of grep -E instead of egrep
-[ ${sw_dupes+x} ] && _print_with_dupe_count || uniq $DATA
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOGFILE"
+}
 
-# publish Do53/DoT over tcp (replied and sorted)
-grep -E '^ipv4 .* tcp .* dport=(53|853) ' /proc/net/nf_conntrack | \
-    awk '/ASSURED/{printf "%s %-19s %-19s %-9s %-19s %s\n",
-            $3, $7, $8, $10, $11, $12}' | \
-        sort > $DATA
+read_conntrack() {
+    [ -r "$NF_CT4" ] && cat "$NF_CT4"
+    [ -r "$NF_CT6" ] && cat "$NF_CT6"
+}
 
-# More script content...
-# Example of corrected conditional checks using grep -E
-if echo $line | grep 'dport=53 ' | \
-        grep -qE "(src|dst)=($wan0_ip|$wan1_ip)( |$)"; then
-    # Do53 connection routed over WAN
-    printf "${sev_lvl_2}$line_4disp${RS}\n"
-elif echo $line | grep 'dport=853 ' | \
-        grep -qE "(src|dst)=($wan0_ip|$wan1_ip)( |$)"; then
-    # DoT connection routed over WAN
-    printf "${sev_lvl_1}$line_4disp${RS}\n"
-fi
-# ... (remaining script content) ...
+process_conntrack() {
+    read_conntrack | grep -E '^ipv[46] .* (udp|tcp) .* dport=(53|853) ' | \
+        awk '/ASSURED/{printf "%s %-19s %-19s %-9s %-19s %s\n", $3, $7, $8, $10, $11, $12}' | \
+        sort
+}
+
+run_loop() {
+    log "dnsmonitor started"
+    while true; do
+        process_conntrack > "$DATA"
+        while IFS= read -r line; do
+            log "$line"
+        done < "$DATA"
+        sleep "$INTERVAL"
+    done
+}
+
+case "$1" in
+    start)
+        check_tools
+        touch "$LOGFILE"
+        run_loop &
+        echo $! > /var/run/dnsmonitor.pid
+        ;;
+    stop)
+        if [ -f /var/run/dnsmonitor.pid ]; then
+            kill "$(cat /var/run/dnsmonitor.pid)" && rm -f /var/run/dnsmonitor.pid
+        fi
+        log "dnsmonitor stopped"
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
